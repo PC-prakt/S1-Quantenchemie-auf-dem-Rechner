@@ -189,17 +189,163 @@ def convert_text(text, current, config):
     return "".join(pieces)
 
 
+def extract_embedded_section(markdown, heading):
+    headings = list(re.finditer(
+        r'(?m)^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$',
+        markdown
+    ))
+
+    def normalize(value):
+        return re.sub(r'[\W_]+', '', value.casefold())
+
+    for i, found in enumerate(headings):
+        if normalize(found.group(2)) == normalize(heading):
+            level = len(found.group(1))
+
+            end = next(
+                (
+                    other.start()
+                    for other in headings[i + 1:]
+                    if len(other.group(1)) <= level
+                ),
+                len(markdown)
+            )
+
+            return markdown[found.start():end]
+
+    return None
+
+
+def render_embeds(markdown, current, config, stack):
+
+    def render_piece(piece):
+        output, last = [], 0
+
+        for match in re.finditer(r'!\[\[([^\]\n]+)\]\]', piece):
+            output.append(
+                convert_text(piece[last:match.start()], current, config)
+            )
+
+            reference = match.group(1).split('|', 1)[0].strip()
+            name, has_section, section = reference.partition('#')
+            source = find_file(name, current)
+
+            if (
+                source is not None
+                and source.suffix.lower() == '.md'
+                and source not in stack
+            ):
+                content = (DOCS / source).read_text(encoding='utf-8')
+
+                if has_section:
+                    content = extract_embedded_section(content, section)
+
+                if content is not None:
+
+                    # Make the embedded heading clickable.
+                    # Clicking it opens the original section.
+
+                    if has_section:
+                        first_line, newline, remainder = content.partition("\n")
+
+                        heading_match = re.match(
+                            r'^(#{1,6})\s+(.+?)\s*$',
+                            first_line
+                        )
+
+                        if heading_match:
+                            heading_text = heading_match.group(2)
+
+                            url = (
+                                published_url(source, config)
+                                + "#"
+                                + slug_heading(heading_text)
+                            )
+
+                            content = (
+                                f'{heading_match.group(1)} '
+                                f'[{heading_text}]({url})'
+                                + newline
+                                + remainder
+                            )
+
+                    # Insert the actual content of the embedded section.
+
+                    output.append(
+                        '\n\n'
+                        + render_embeds(
+                            content,
+                            source,
+                            config,
+                            stack | {source}
+                        ).strip()
+                        + '\n\n'
+                    )
+
+                else:
+                    print(
+                        f'WARNING: Embedded section not found '
+                        f'in {source}: {section}'
+                    )
+
+                    UNRESOLVED.add(
+                        (current.as_posix(), reference)
+                    )
+
+                    output.append(
+                        convert_text(match.group(0), current, config)
+                    )
+
+            else:
+                if (
+                    source is not None
+                    and source in stack
+                    and source.suffix.lower() == '.md'
+                ):
+                    print(
+                        f'WARNING: Circular embed: {current} -> {source}'
+                    )
+
+                output.append(
+                    convert_text(match.group(0), current, config)
+                )
+
+            last = match.end()
+
+        output.append(
+            convert_text(piece[last:], current, config)
+        )
+
+        return ''.join(output)
+
+    pieces, last = [], 0
+
+    # Preserve fenced code blocks without modifying them.
+
+    for fence in FENCE.finditer(markdown):
+        pieces.append(
+            render_piece(markdown[last:fence.start()])
+        )
+
+        pieces.append(fence.group(0))
+        last = fence.end()
+
+    pieces.append(
+        render_piece(markdown[last:])
+    )
+
+    return ''.join(pieces)
+
+
 def on_page_markdown(markdown, page, config, files):
-    current = PurePosixPath(page.file.src_path)
-    current = Path(str(current))
-    # Leave fenced code examples untouched.
-    parts, end = [], 0
-    for match in FENCE.finditer(markdown):
-        parts.append(convert_text(markdown[end:match.start()], current, config))
-        parts.append(match.group(0))
-        end = match.end()
-    parts.append(convert_text(markdown[end:], current, config))
-    return "".join(parts)
+    current = Path(page.file.src_path)
+
+    return render_embeds(
+        markdown,
+        current,
+        config,
+        {current}
+    )
 
 
 class _Links(HTMLParser):
